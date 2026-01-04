@@ -1,0 +1,985 @@
+---
+title: "Data Bowl"
+author: "Ajay Shenoy"
+date: "2026-01-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Executive summary
+This Project attempts to quantify defensive player processing in the NFL using player tracking data and play by play information to better understand how defenders react when the ball is in the air and how their reaction time and ability influence the outcome of plays. Using 2023 tracking files courtesy of the big data bowl, we merged thousands of frame by frame observations with play by play data from nflfastR to create a dataset that could be used to show. how different defenders react and make decisions in split second situations and to see if certain players reaction ability results in better overall defensive outcomes.
+
+The main goal of this model was to measure individual defender’s impact by identifying how they position themselves in relation to a ballcarrier and in relation to the football’s trajectory while it is in the air. We then related this to how their positioning and reactions affected the EPA of the play to show just how much what a player did affected the outcome of a play. To do this, we chose a multitude of different spatial and movement based predictors. These predictors consist of: Pursuit vectors, Predicted tackle points, Distances to the ball, Ball-in-air tracking behavior, optimal pursuit angles.
+
+These predictors are able to outline the framework of what a given play looks like by capturing the situational and geometric spatial context. Through this we are able to take a deeper look into how quickly individual defenders react, where they choose to move, and how effectively they are able to close space in order to make a play. We took this a step further by adding additional analysis more closely focused on behavior for defensive backs versus pass catchers for when the ball is in the air. By isolating the frames from the moment the ball is released to the outcome of the pass, we were able to assess multiple players’ movement vectors toward the ball, their speed towards the ball, along with positioning efficiencies for any player in the area of the pass. This provided a detailed look at how effective defenders are able to track passes and how their positioning affects the completion probability of a pass.
+
+Now that we have these metrics in place, we can directly compare defenders to one another in terms of their processing speed, efficiency in pursuit, and ball tracking proficiency. Because the model quantifies how quickly different players are able to close space, how effectively they are able to move toward predicted tackle points, and how they position themselves while the ball is in the air, we can evaluate different one on one outcomes. For example, we can pair a defender’s pursuit metrics against a ballcarrier’s acceleration and movement vectors to predict which player is more likely to “win” a gap interaction in real time. We can also compare ball-tracking speed, angle of approach, and positioning for ball catchers and defensive backs to assess who is more likely to come down with a contested catch. These comparisons turn our raw tracking metrics into practical evaluation tools, allowing teams to project matchup outcomes, evaluate player strengths, and better understand how individual processing ability translates to success.
+
+The applications of a defensive decision making engine like this are endless. Teams could use this model to better understand individual defender efficiency in terms of their processing and closing ability along with being able to assess their overall coverage ability. Additionally, teams could identify optimal pursuit angles and tendencies to better defend against different offensive looks. Coaches and analysts could also use this framework to investigate different “what-if” defensive scenarios or compare scheme tendencies across players and positions.
+
+Overall, this project provides a way for evaluators to better understand how defenders process and react in the heat of a play in the NFL. By combining spatial modeling, play by play context, and advanced metrics like EPA numbers, the model creates a foundation for quantifying defensive skill, positioning, and play impact. In the future, the model could be expanded to incorporate machine learning classifiers to include catch probability, position/defensive role specific grading, and multiyear performance stability offering an even deeper look at defensive processing in the modern NFL.
+
+Technical Report
+Load libraries. 
+```{r}
+library(dplyr)
+library(readr)
+library(nflfastR)
+library(ggplot2)
+library(tidyr)
+```
+
+First we need to organize all of the train and supplementary data into one neat df called ‘tracking_full.’ We do this by merging all of the tracking with standard NFL Fastr pbp data for 2023, which is the year we have data for. This is an example output with key columsn selected, with s meaning speed and a meaning acceleration.
+```{r}
+# Base directory
+base_dir <- "/Users/ajayshenoy/Documents/stat479/114239_nfl_competition_files_published_analytics_final/"
+
+# Function to read and combine weekly files
+read_weekly_files <- function(pattern) {
+  files <- list.files(path = file.path(base_dir, "train"), pattern = pattern, full.names = TRUE)
+  df_list <- lapply(files, read_csv)
+  combined <- bind_rows(df_list)
+  return(combined)
+}
+
+# Read all input files (w01-w18)
+inputs <- read_weekly_files("input_2023_w[0-9]{2}\\.csv")
+
+# Read all output files (w01-w18)
+outputs <- read_weekly_files("output_2023_w[0-9]{2}\\.csv")
+
+# Read supplementary file
+supplementary <- read_csv(file.path(base_dir, "supplementary_data.csv"))
+
+#2023 data
+pbp_2023 <- load_pbp(2023)
+
+# Convert nflfastR old_game_id to numeric
+pbp_2023 <- pbp_2023 %>%
+  mutate(old_game_id_num = as.numeric(old_game_id))
+
+#merge data bowl with fastr
+# Merge supplementary + input + output first
+tracking_full <- outputs %>%
+  left_join(inputs, by = c("game_id", "play_id", "nfl_id", "frame_id")) %>%
+  left_join(supplementary, by = c("game_id", "play_id"))
+
+# Merge with nflfastR pbp
+tracking_full <- tracking_full %>%
+  left_join(pbp_2023, by = c("game_id" = "old_game_id_num", "play_id" = "play_id"))
+
+tracking_full <- tracking_full %>%
+  rename(
+    x = x.x,    # OUTPUT player x after throw
+    y = y.x,    # OUTPUT player y after throw
+    x_input = x.y,   # INPUT player x before throw
+    y_input = y.y    # INPUT player y before throw
+  )
+head(tracking_full)
+```
+
+```{r}
+tracking_full %>% select(play_id, frame_id, x, y, player_name, player_role, s, a) %>% slice_max(order_by = s, n = 10)
+```
+
+We need to select define our key positions as well as get the euclidean distance (using standard (x, y) coordinates) we do this in ‘tracking_pos.’ We then get the players initial position which is the first time they appear in the play, or the first frame. Next, we need to find the ‘optimal’ path to the ball based on the euclidean distance, as well as tracking their initial motion to see how close they dart to perfect position immediately. For this, there are two components, direction and speed (much like any standard vector), this is ‘how much’ of their speed is going towards the ball, positive being towards and negative being away.
+
+```{r}
+positions_of_interest <- c("SS", "CB", "WR", "TE", "RB", "FS", "MLB", "S", "OLB", "ILB")
+
+tracking_pos <- tracking_full %>%
+  filter(player_position %in% positions_of_interest)
+
+#get distance to ball landing spot at each frame
+tracking_pos <- tracking_pos %>%
+  mutate(dist_to_ball = sqrt((x - ball_land_x)^2 + (y - ball_land_y)^2))
+
+#compute optimal distance for each frame
+initial_positions <- tracking_pos %>%
+  group_by(game_id, play_id, nfl_id) %>%
+  slice(1) %>%
+  select(game_id, play_id, nfl_id, x_init = x, y_init = y)
+
+# ---------------------------------------------
+# Add the initial positions back to the full tracking dataset
+# Then compute several metrics:
+# - optimal straight-line distance
+# - movement vector toward ball
+# - player's actual motion vector
+# - speed in direction of ball
+# ---------------------------------------------
+tracking_pos <- tracking_pos %>%
+  left_join(initial_positions, by = c("game_id", "play_id", "nfl_id")) %>%
+  
+  mutate(
+    optimal_distance = sqrt((x_init - ball_land_x)^2 + (y_init - ball_land_y)^2),
+    vec_to_ball_x = ball_land_x - x,
+    vec_to_ball_y = ball_land_y - y,
+    
+    # Actual motion vector based on player's speed (s) and direction (dir):
+    # dir is in degrees, so convert to radians
+    # s * cos(dir) gives x-component of movement
+    # s * sin(dir) gives y-component of movement
+
+    motion_vec_x = s * cos(dir * pi/180),
+    motion_vec_y = s * sin(dir * pi/180),
+    
+    speed_toward_ball =
+      (motion_vec_x * vec_to_ball_x + motion_vec_y * vec_to_ball_y) / sqrt(vec_to_ball_x^2 + vec_to_ball_y^2),
+    accel_toward_ball = a * sign(speed_toward_ball)
+  )
+
+tracking_pos %>% select(player_name, frame_id, optimal_distance, vec_to_ball_x, vec_to_ball_y, motion_vec_x, motion_vec_y, speed_toward_ball, dist_to_ball)  %>% head()
+```
+
+Now to grade their reaction times by frame we need to look at the lagged distance from frame to frame and then judge at what point they make a move towards the ball. To judge this we get the first frame where distance_to_ball < previous frame, which indicates closing move on the ball. After filtering only for these frames, whats left is the first frame at which they react to the ball. We get a reaction time column and add it to the original dataset.
+
+```{r}
+reaction_times <- tracking_pos %>%
+  group_by(game_id, play_id, nfl_id) %>%
+  arrange(frame_id) %>%   # ensure chronological order
+  mutate(dist_lag = lag(dist_to_ball)) %>%
+  filter(dist_to_ball < dist_lag) %>%
+  summarise(reaction_frame = min(frame_id, na.rm = TRUE), .groups = "drop")
+
+tracking_pos <- tracking_pos %>%
+  left_join(reaction_times, by = c("game_id", "play_id", "nfl_id"))
+```
+
+This procedure mirrors our earlier pursuit modeling but extends it to the tackle phase. We identify the ball carrier in each frame, project their likely future location based on current velocity, and compute each defender’s distance and optimal angle to that predicted point. Unlike the previous approach, which targeted a fixed landing spot, this captures pursuit toward a moving, future location, emphasizing anticipation rather than reaction.
+
+We quantified defensive backs impact by linking their tracking data with EPA play by play and measuring how often they reduced offensive value. For each DB (positions “CB”, “SS”, “FS”, “S”), we identified their closest approach to the ball and assigned “EPA prevented” for interceptions, tight coverage leading to incompletions, or plays where coverage forced negative EPA. We then aggregated these values by player, filtering for sufficient volume and ranking defenders by total EPA prevented.
+
+```{r}
+db_positions <- c("CB", "SS", "FS", "S")
+
+# Calculate EPA impact for DBs
+db_epa_impact <- tracking_pos %>%
+  filter(player_position %in% db_positions, !is.na(epa)) %>%
+  group_by(game_id, play_id, nfl_id, player_name, player_position) %>%
+  summarise(
+    min_dist_to_ball = min(dist_to_ball, na.rm = TRUE),
+    epa_on_play = first(epa),
+    incomplete_pass = first(incomplete_pass),
+    interception = first(interception),
+    .groups = "drop"
+  ) %>%
+  # Calculate EPA prevented
+  mutate(
+    epa_prevented = case_when(
+      # --- 1. Interceptions: full EPA swing ---
+      interception == 1 ~ abs(epa_on_play),  
+      #if db within 2 yards they get credit for incompletion
+      # --- 2. Tight coverage causing an incompletion ---
+      incomplete_pass == 1 & min_dist_to_ball < 2 ~ abs(epa_on_play),
+      # if offense lose epa and no coverage recorded db still contributed
+      # --- 3. Tight coverage that forces a low-EPA result ---
+      epa_on_play < 0 ~ abs(epa_on_play),
+      TRUE ~ 0
+    )
+  )
+
+# Aggregate by player
+db_epa_summary <- db_epa_impact %>%
+  group_by(nfl_id, player_name, player_position) %>%
+  summarise(
+    total_epa_prevented = sum(epa_prevented, na.rm = TRUE),
+    avg_epa_prevented = mean(epa_prevented, na.rm = TRUE),
+    plays_covered = n(),
+    interceptions = sum(interception, na.rm = TRUE),
+    tight_coverage_plays = sum(min_dist_to_ball < 2, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(plays_covered >= 25) %>%
+  arrange(desc(total_epa_prevented))
+```
+
+```{r}
+# Visualize top DBs by EPA prevented
+ggplot(db_epa_summary %>% head(20), 
+       aes(x = reorder(player_name, total_epa_prevented), 
+           y = total_epa_prevented, fill = player_position)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Top DBs by Total EPA Prevented",
+       x = "Player", y = "Total EPA Prevented", fill = "Position") +
+  theme_minimal()
+```
+
+We estimated how often defensive backs were targeted by identifying, on each pass play, the defender closest to the ball at the moment of the forward pass and labeling them as the primary coverage defender. We also counted total coverage snaps for each defensive back (all pass plays in which they were on the field) and summarized how many of those snaps resulted in a target. This provides simple workload and involvement measures for coverage players.
+
+```{r}
+#see how often each dbs are targeted
+# Identify for each play the DB who was closest to the ball at forward pass time
+targets <- tracking_pos %>%
+  filter(player_position %in% db_positions, play_type == "pass") %>%
+  group_by(game_id, play_id) %>%
+  slice_min(dist_to_ball, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(targeted = 1)
+
+#count coverage snaps for dbs
+#all pass plays, not attempts
+coverage_snaps <- tracking_pos %>%
+  filter(player_position %in% db_positions, play_type == "pass") %>%
+  group_by(nfl_id, player_name, player_position) %>%
+  summarise(coverage_snaps = n_distinct(play_id), .groups = "drop")
+
+#count targets
+db_targets <- targets %>%
+  group_by(nfl_id, player_name, player_position) %>%
+  summarise(targets = n(), .groups = "drop") %>% arrange(-targets)
+
+db_targets
+```
+
+```{r}
+# Merge and calculate target rate, including a minimum coverage snaps threshold
+min_snaps <- 25
+
+#merge and calculate target rate
+db_target_rate <- coverage_snaps %>%
+  left_join(db_targets, by = c("nfl_id", "player_name", "player_position")) %>%
+  mutate(
+    targets = replace_na(targets, 0),
+    target_rate = targets / coverage_snaps
+  ) %>%
+  #filter by min coverage snaps
+  filter(coverage_snaps >= min_snaps) %>%
+  arrange(target_rate)
+
+#graph lowest target rate
+ggplot(db_target_rate %>% head(20),
+       aes(x = reorder(player_name, target_rate),
+           y = target_rate,
+           fill = player_position)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "DBs with Lowest Target Rate (Least Thrown At)",
+       x = "Player",
+       y = "Target Rate (Targets / Coverage Snaps)") +
+  theme_minimal()
+```
+
+This analysis mirrors our earlier defender reaction modeling but focuses specifically on linebackers responding to screens and play-action passes rather than general pursuit. We measured each player’s initial reaction frame and speed toward the ball on these plays, then aggregated across frequent participants to identify the fastest responders. Like previous sections, this approach goes frame by frame tracking to quantify reaction timing, but it applies the method to targeted play types that test anticipation rather than straight line euclidian pursuit.
+
+```{r}
+lb_positions <- c("OLB", "ILB", "MLB")
+
+# Filter for screens and play-action passes
+lb_reaction_analysis <- tracking_pos %>%
+  filter(player_position %in% lb_positions) %>%
+  filter(!is.na(play_action) | !is.na(pass_location)) %>%
+  mutate(
+    is_screen_or_short = pass_location %in% c("short left", "short middle", "short right") |
+      air_yards < 5,
+    is_play_action = play_action == 1
+  ) %>%
+  filter(is_screen_or_short | is_play_action) %>%
+  group_by(game_id, play_id, nfl_id, player_name, player_position) %>%
+  summarise(
+    reaction_frame = first(reaction_frame),
+    avg_speed = mean(speed_toward_ball, na.rm = TRUE),
+    max_speed = max(s, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Aggregate by player
+lb_reaction_summary <- lb_reaction_analysis %>%
+  group_by(nfl_id, player_name, player_position) %>%
+  summarise(
+    avg_reaction_frame = mean(reaction_frame, na.rm = TRUE),
+    avg_speed_to_ball = mean(avg_speed, na.rm = TRUE),
+    max_speed_achieved = mean(max_speed, na.rm = TRUE),
+    screen_pa_plays = n(),
+    .groups = "drop"
+  ) %>%
+  filter(screen_pa_plays >= 15) %>%
+  arrange(avg_reaction_frame)
+
+# Visualize LB reaction times
+ggplot(lb_reaction_summary %>% head(15), 
+       aes(x = reorder(player_name, -avg_reaction_frame), 
+           y = avg_reaction_frame, fill = player_position)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "LB Reaction Time on Screens/Play Action",
+       subtitle = "Lower = Faster Reaction",
+       x = "Player", y = "Avg Reaction Frame") +
+  theme_minimal()
+```
+
+This ball-in-air analysis follows the same general framework as our previous pursuit and reaction metrics. Like before, we compute distances and motion vectors to measure how effectively players direct toward the ball. The key difference is that here we focus specifically on passes while the ball is airborne, capturing both receivers tracking behavior and defenders coverage responses, rather than static landing points or anticipated tackle positions.
+
+Note - we process this week by week instead of all at once, for efficiency
+
+```{r}
+# ---------------------------------------------
+# BALL-IN-AIR PURSUIT ANALYSIS
+# Analyzing WR, TE, and DB performance tracking the ball
+# ---------------------------------------------
+
+# Define positions for ball-in-air analysis
+air_positions <- c("WR", "TE", "CB", "SS", "FS", "S")
+
+# ---------------------------------------------
+# 1. IDENTIFY BALL-IN-AIR FRAMES
+# Ball is in air from snap until pass outcome
+# ---------------------------------------------
+# Process by week instead of all at once
+weeks <- unique(tracking_pos$week.x) # if you have a week column
+
+results_list <- list()
+for(w in weeks) {
+  cat("Processing week", w, "\n")
+  
+  week_data <- tracking_pos %>%
+    filter(week.x == w,  # process one week at a time
+           player_position %in% air_positions,
+           play_type == "pass",
+           !is.na(ball_land_x), !is.na(ball_land_y)) %>%
+    select(
+      game_id, play_id, nfl_id, player_name, player_position, 
+      frame_id, x, y, s, dir, 
+      ball_land_x, ball_land_y, dist_to_ball, speed_toward_ball,
+      motion_vec_x, motion_vec_y,       # movement vector
+      vec_to_ball_x, vec_to_ball_y,     # vector to ball
+      complete_pass, interception        # play outcomes
+    )
+  
+  # Run your analysis on week_data
+  # Store results
+  results_list[[w]] <- week_data # or processed results
+  
+  rm(week_data)  # free memory
+  gc()  # garbage collection
+}
+
+ball_in_air <- bind_rows(results_list)
+
+ball_in_air %>% head()
+```
+
+We derived detailed pursuit metrics for players while the ball is in the air, extending the same framework used in earlier pursuit analyses. Like previous work, we measure distances, speed, and directional alignment relative to a target, but here we quantify efficiency and angle error across the entire ball-in-air window rather than at a single endpoint. These metrics capture how effectively receivers track the ball and how defenders cover them, putting frame by frame data into player-level summaries that include speed, distance closed, pursuit efficiency, directional accuracy, and consistency across plays.
+
+```{r}
+# ---------------------------------------------
+# 2. PURSUIT METRICS WHILE BALL IS IN AIR
+# ---------------------------------------------
+pursuit_metrics <- ball_in_air %>%
+  group_by(game_id, play_id, nfl_id, player_name, player_position) %>%
+  arrange(frame_id) %>%
+  mutate(
+    # Track distance changes frame-to-frame
+    dist_change = dist_to_ball - lag(dist_to_ball),
+    closing_distance = dist_change < 0,  # TRUE when getting closer
+    
+    # Angle between player's movement and optimal direction to ball
+    actual_direction = atan2(motion_vec_y, motion_vec_x) * 180/pi,
+    optimal_direction = atan2(vec_to_ball_y, vec_to_ball_x) * 180/pi,
+    angle_error = abs(actual_direction - optimal_direction),
+    # Normalize angle error to 0-180 range
+    angle_error = ifelse(angle_error > 180, 360 - angle_error, angle_error),
+    
+    # Pursuit efficiency: how much of speed is directed toward ball
+    pursuit_efficiency = speed_toward_ball / (s + 0.1)  # add small constant to avoid division by zero
+  ) %>%
+  summarise(
+    # Distance metrics
+    initial_distance = first(dist_to_ball),
+    final_distance = last(dist_to_ball),
+    distance_closed = initial_distance - final_distance,
+    distance_closed_pct = distance_closed / initial_distance * 100,
+    
+    # At catchpoint (final frame)
+    distance_at_catch = last(dist_to_ball),
+    
+    # Pursuit quality
+    avg_speed = mean(s, na.rm = TRUE),
+    avg_speed_toward_ball = mean(speed_toward_ball, na.rm = TRUE),
+    avg_pursuit_efficiency = mean(pursuit_efficiency, na.rm = TRUE),
+    avg_angle_error = mean(angle_error, na.rm = TRUE),
+    
+    # Consistency
+    pct_frames_closing = mean(closing_distance, na.rm = TRUE) * 100,
+    
+    # Play outcome
+    pass_result = first(complete_pass),
+    interception = first(interception),
+    
+    .groups = "drop"
+  ) %>%
+  # Tag offensive vs defensive players
+  mutate(
+    player_type = ifelse(player_position %in% c("WR", "TE"), "Offense", "Defense")
+  )
+
+# ---------------------------------------------
+# 3. PLAYER-LEVEL AGGREGATION
+# ---------------------------------------------
+player_pursuit_summary <- pursuit_metrics %>%
+  group_by(nfl_id, player_name, player_position, player_type) %>%
+  summarise(
+    plays = n(),
+    
+    # Pursuit effectiveness
+    avg_distance_closed = mean(distance_closed, na.rm = TRUE),
+    avg_distance_closed_pct = mean(distance_closed_pct, na.rm = TRUE),
+    avg_final_distance = mean(distance_at_catch, na.rm = TRUE),
+    
+    # Speed metrics
+    avg_pursuit_speed = mean(avg_speed, na.rm = TRUE),
+    avg_speed_to_ball = mean(avg_speed_toward_ball, na.rm = TRUE),
+    avg_efficiency = mean(avg_pursuit_efficiency, na.rm = TRUE),
+    
+    # Route running / coverage quality
+    avg_angle_error = mean(avg_angle_error, na.rm = TRUE),
+    consistency_score = mean(pct_frames_closing, na.rm = TRUE),
+    
+    # Outcomes (for DBs)
+    interceptions = sum(interception, na.rm = TRUE),
+    
+    .groups = "drop"
+  ) %>%
+  filter(plays >= 25)  # Minimum sample size
+```
+
+```{r}
+# ---------------------------------------------
+# 4. VISUALIZATIONS
+# ---------------------------------------------
+
+# Top WRs/TEs: Best at getting to the catch point
+ggplot(player_pursuit_summary %>% 
+         filter(player_type == "Offense") %>% 
+         arrange(avg_final_distance) %>% 
+         head(20),
+       aes(x = reorder(player_name, -avg_final_distance),
+           y = avg_final_distance,
+           fill = player_position)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "WR/TE: Closest to Ball at Catch Point",
+       subtitle = "Average distance from ball landing spot (lower = better)",
+       x = "Player",
+       y = "Avg Distance at Catch (yards)",
+       fill = "Position") +
+  theme_minimal()
+
+# Top DBs: Best at closing distance
+ggplot(player_pursuit_summary %>% 
+         filter(player_type == "Defense") %>% 
+         arrange(desc(avg_distance_closed)) %>% 
+         head(20),
+       aes(x = reorder(player_name, avg_distance_closed),
+           y = avg_distance_closed,
+           fill = player_position)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "DBs: Best at Closing Distance While Ball in Air",
+       subtitle = "Average yards closed from initial to catch point (higher = better)",
+       x = "Player",
+       y = "Avg Distance Closed (yards)",
+       fill = "Position") +
+  theme_minimal()
+
+# Pursuit efficiency comparison: WR vs DB
+ggplot(player_pursuit_summary %>% head(30),
+       aes(x = avg_efficiency,
+           y = avg_distance_closed_pct,
+           color = player_type,
+           size = plays)) +
+  geom_point(alpha = 0.7) +
+  geom_text(aes(label = ifelse(plays > 100, player_name, "")), 
+            hjust = -0.1, size = 3, show.legend = FALSE) +
+  labs(title = "Pursuit Efficiency vs Distance Closed %",
+       subtitle = "How efficiently players pursue the ball while in air",
+       x = "Pursuit Efficiency (speed toward ball / total speed)",
+       y = "Distance Closed %",
+       color = "Player Type",
+       size = "Plays") +
+  theme_minimal()
+
+# Route precision: WRs with best angle efficiency
+ggplot(player_pursuit_summary %>% 
+         filter(player_type == "Offense") %>% 
+         arrange(avg_angle_error) %>% 
+         head(20),
+       aes(x = reorder(player_name, avg_angle_error),
+           y = avg_angle_error,
+           fill = player_position)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "WR/TE: Best Route Precision to Ball",
+       subtitle = "Average angle error from optimal pursuit path (lower = better)",
+       x = "Player",
+       y = "Avg Angle Error (degrees)",
+       fill = "Position") +
+  theme_minimal()
+```
+
+These 3 tables chart the top WRs by distance to the ball AT the catch point, top DBs by closing distance, and most ‘efficient’ route runners which essnetially means a low angle error. (These are ranked and only display the top 10)
+
+```{r}
+# ---------------------------------------------
+# 5. PRINT TOP PERFORMERS
+# ---------------------------------------------
+cat("\n=== TOP WRs BY DISTANCE TO BALL AT CATCH ===\n")
+print(player_pursuit_summary %>% 
+        filter(player_type == "Offense") %>% 
+        arrange(avg_final_distance) %>% 
+        select(player_name, player_position, plays, avg_final_distance, avg_efficiency) %>%
+        head(10))
+
+cat("\n=== TOP DBs BY DISTANCE CLOSED ===\n")
+print(player_pursuit_summary %>% 
+        filter(player_type == "Defense") %>% 
+        arrange(desc(avg_distance_closed)) %>% 
+        select(player_name, player_position, plays, avg_distance_closed, avg_distance_closed_pct) %>%
+        head(10))
+
+cat("\n=== MOST EFFICIENT ROUTE RUNNERS (LOW ANGLE ERROR) ===\n")
+print(player_pursuit_summary %>% 
+        filter(player_type == "Offense") %>% 
+        arrange(avg_angle_error) %>% 
+        select(player_name, player_position, plays, avg_angle_error, avg_efficiency) %>%
+        head(10))
+```
+
+We next examined defender vs receiver separation on passing plays to evaluate coverage and route execution. Using frame level tracking, we paired each defensive back with receivers on the same play and computed the distance between them at each frame, producing both average separation over the route and separation at the catch point. Aggregating these measures across plays allowed us to rank defenders by tightest coverage and receivers by largest separation. This approach extends the same concepts of movement and distance from previous analyses, but now focuses on relative positioning between players rather than movement toward a fixed target or predicted location.
+
+```{r}
+db_positions  <- c("CB", "SS", "FS", "S")
+off_positions <- c("WR", "TE")
+
+weeks <- unique(tracking_pos$week.x)
+
+sep_list <- list()
+i <- 1
+
+for (w in weeks) {
+  cat("Processing week", w, "\n")
+  
+  week_data <- tracking_pos %>%
+    filter(
+      week.x == w,
+      play_type == "pass",
+      player_position %in% c(db_positions, off_positions)
+    ) %>%
+    select(
+      game_id, play_id, frame_id,
+      nfl_id, player_name, player_position,
+      x, y
+    )
+  
+  # ----------- DB side -----------
+  db_side <- week_data %>%
+    filter(player_position %in% db_positions) %>%
+    rename(
+      db_id   = nfl_id,
+      db_name = player_name,
+      db_position = player_position,   # <-- KEEP POSITION
+      db_x    = x,
+      db_y    = y
+    )
+  
+  # ----------- WR/TE side -----------
+  wr_side <- week_data %>%
+    filter(player_position %in% off_positions) %>%
+    rename(
+      wr_id   = nfl_id,
+      wr_name = player_name,
+      wr_x    = x,
+      wr_y    = y
+    )
+  
+  # ----------- Join DB ↔ WR within game/play/frame -----------
+  week_sep <- db_side %>%
+    inner_join(
+      wr_side,
+      by = c("game_id", "play_id", "frame_id")
+    ) %>%
+    mutate(
+      separation = sqrt((db_x - wr_x)^2 + (db_y - wr_y)^2)
+    )
+  
+  sep_list[[i]] <- week_sep
+  i <- i + 1
+  
+  rm(week_data, db_side, wr_side, week_sep)
+  gc()
+}
+
+db_separation <- bind_rows(sep_list)
+
+db_coverage_summary <- db_separation %>%
+  group_by(game_id, play_id, db_id, db_name, db_position) %>%   # <-- ADD db_position
+  summarise(
+    separation_at_catch = separation[which.max(frame_id)],
+    avg_separation      = mean(separation, na.rm = TRUE),
+    n_frames            = n(),
+    .groups = "drop"
+  )
+
+db_ranking <- db_coverage_summary %>%
+  group_by(db_id, db_name, db_position) %>%   # <-- include position
+  summarise(
+    plays_covered              = n(),
+    avg_separation_at_catch    = mean(separation_at_catch, na.rm = TRUE),
+    avg_separation_over_route  = mean(avg_separation, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(plays_covered >= 25) %>%
+  arrange(avg_separation_at_catch)
+```
+
+DBs at the catch point
+```{r}
+ggplot(db_ranking %>% head(20),
+       aes(x = reorder(db_name, avg_separation_at_catch),
+           y = avg_separation_at_catch,
+           fill = db_position)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "DBs with Tightest Coverage at Catch",
+    x = "Player",
+    y = "Avg Separation at Catch (yards)",
+    fill = "Position"
+  ) +
+  theme_minimal()
+```
+
+DBs throughout the entire route
+```{r}
+ggplot(db_ranking %>% head(20),
+       aes(x = reorder(db_name, avg_separation_over_route),
+           y = avg_separation_over_route,
+           fill = db_name)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "DBs with Tightest Coverage Throughout Route",
+       x = "Player", y = "Avg Separation Over Route (yards)",
+       fill = "Position") +
+  theme_minimal()
+```
+
+Separating the data for just wide receivers vs dbs.
+```{r}
+wr_coverage_summary <- db_separation %>%
+  group_by(game_id, play_id, wr_id, wr_name) %>%
+  summarise(
+    separation_at_catch = separation[which.max(frame_id)],
+    avg_separation      = mean(separation, na.rm = TRUE),
+    n_frames            = n(),
+    .groups = "drop"
+  )
+
+wr_ranking <- wr_coverage_summary %>%
+  group_by(wr_id, wr_name) %>%
+  summarise(
+    plays_run                = n(),
+    avg_separation_at_catch = mean(separation_at_catch, na.rm = TRUE),
+    avg_separation_over_route = mean(avg_separation, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(plays_run >= 25) %>%     # same threshold as DBs for stability
+  arrange(desc(avg_separation_at_catch))  # highest separation = better
+```
+
+WRs at the catch point
+```{r}
+ggplot(wr_ranking %>% head(20),
+       aes(x = reorder(wr_name, avg_separation_at_catch),
+           y = avg_separation_at_catch)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "WRs with Most Separation at Catch",
+    x = "Player",
+    y = "Avg Separation at Catch (yards)"
+  ) +
+  theme_minimal()
+```
+
+WRs through the route
+```{r}
+ggplot(wr_ranking %>% head(20),
+       aes(x = reorder(wr_name, avg_separation_over_route),
+           y = avg_separation_over_route)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "WRs with Most Separation Throughout Route",
+    x = "Player",
+    y = "Avg Separation Over Route (yards)"
+  ) +
+  theme_minimal()
+```
+
+Building on earlier separation and coverage work, we examined WR performance when space is limited, linking separation at the catch point to pass outcomes. Rather than measuring who creates or prevents separation (as in previous sections), this analysis focuses on who succeeds despite tight coverage.
+
+We summarized completion rates by separation level, modeled the continuous relationship, and identified WRs who perform unusually well in contested situations (<2 yards)—either relative to the league or relative to their own open-catch performance. This provides a complementary view of receiver skill, emphasizing finishing ability under pressure rather than space creation.
+
+```{r}
+# ---------------------------------------------
+# CONTESTED CATCH ANALYSIS
+# Which WRs catch best in tight coverage?
+# ---------------------------------------------
+
+# Step 1: Get separation at catch point for each WR target
+# Need to link separation data with pass outcomes
+wr_contested <- db_separation %>%
+  group_by(game_id, play_id, wr_id, wr_name) %>%
+  summarise(
+    separation_at_catch = separation[which.max(frame_id)],
+    avg_separation = mean(separation, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Step 2: Get pass outcomes from tracking_pos
+pass_outcomes <- tracking_pos %>%
+  filter(player_position %in% c("WR", "TE"), play_type == "pass") %>%
+  group_by(game_id, play_id, nfl_id, player_name) %>%
+  summarise(
+    complete = first(complete_pass),
+    incomplete = first(incomplete_pass),
+    interception = first(interception),
+    .groups = "drop"
+  )
+
+# Step 3: Merge separation with outcomes
+wr_catch_analysis <- wr_contested %>%
+  left_join(
+    pass_outcomes,
+    by = c("game_id" = "game_id", "play_id" = "play_id", 
+           "wr_id" = "nfl_id", "wr_name" = "player_name")
+  ) %>%
+  filter(!is.na(complete)) %>%
+  mutate(
+    # Create separation bins
+    sep_category = case_when(
+      separation_at_catch < 1 ~ "0-1 yd (Tight)",
+      separation_at_catch < 2 ~ "1-2 yds",
+      separation_at_catch < 3 ~ "2-3 yds",
+      separation_at_catch < 4 ~ "3-4 yds",
+      TRUE ~ "4+ yds (Open)"
+    ),
+    sep_category = factor(sep_category, 
+                          levels = c("0-1 yd (Tight)", "1-2 yds", 
+                                     "2-3 yds", "3-4 yds", "4+ yds (Open)"))
+  )
+
+# ---------------------------------------------
+# VISUALIZATION 1: Overall Completion Rate by Separation
+# ---------------------------------------------
+completion_by_sep <- wr_catch_analysis %>%
+  group_by(sep_category) %>%
+  summarise(
+    targets = n(),
+    completions = sum(complete, na.rm = TRUE),
+    completion_rate = completions / targets * 100,
+    .groups = "drop"
+  )
+
+ggplot(completion_by_sep, 
+       aes(x = sep_category, y = completion_rate)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = sprintf("%.1f%%\n(%d/%d)", 
+                                completion_rate, completions, targets)),
+            vjust = -0.5, size = 3) + coord_cartesian(clip = "off") + 
+  labs(title = "Pass Completion Rate by Separation at Catch",
+       subtitle = "How separation affects catch probability",
+       x = "Separation at Catch Point",
+       y = "Completion Rate (%)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# ---------------------------------------------
+# VISUALIZATION 2: Smooth curve of completion by separation
+# ---------------------------------------------
+ggplot(wr_catch_analysis, 
+       aes(x = separation_at_catch, y = complete)) +
+  geom_point(alpha = 0.2, size = 1) +
+  geom_smooth(method = "loess", se = TRUE, color = "red", size = 1.5) +
+  labs(title = "Pass Completion Probability by Exact Separation",
+       subtitle = "Smooth curve shows relationship between separation and catches",
+       x = "Separation at Catch (yards)",
+       y = "Completion Probability") +
+  scale_y_continuous(labels = scales::percent_format(scale = 100)) +
+  theme_minimal()
+```
+
+```{r}
+# ---------------------------------------------
+# VISUALIZATION 3: WRs who excel in contested catches
+# Analyze WRs with minimum 15 targets in tight coverage (< 2 yards)
+# ---------------------------------------------
+contested_specialists <- wr_catch_analysis %>%
+  filter(separation_at_catch < 2) %>%  # Tight coverage only
+  group_by(wr_id, wr_name) %>%
+  summarise(
+    contested_targets = n(),
+    contested_catches = sum(complete, na.rm = TRUE),
+    contested_catch_rate = contested_catches / contested_targets * 100,
+    avg_separation = mean(separation_at_catch, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(contested_targets >= 15) %>%  # Minimum sample size
+  arrange(desc(contested_catch_rate))
+
+ggplot(contested_specialists %>% head(20),
+       aes(x = reorder(wr_name, contested_catch_rate),
+           y = contested_catch_rate)) +
+  geom_col(fill = "darkgreen") +
+  geom_text(aes(label = sprintf("%.1f%%\n(%d/%d)", 
+                                contested_catch_rate, 
+                                contested_catches, 
+                                contested_targets)),
+            hjust = -0.1, size = 2.5) +
+  coord_flip() +
+  labs(title = "Best WRs at Contested Catches",
+       subtitle = "Catch rate when covered within 2 yards (min 15 targets)",
+       x = "Player",
+       y = "Contested Catch Rate (%)") +
+  theme_minimal()
+```
+
+```{r}
+# ---------------------------------------------
+# VISUALIZATION 4: Catch rate vs separation (scatter)
+# Compare WRs on both open and contested situations
+# ---------------------------------------------
+
+wr_by_coverage <- wr_catch_analysis %>%
+  mutate(is_contested = separation_at_catch < 2) %>%
+  group_by(wr_id, wr_name) %>%
+  summarise(
+    total_targets = n(),
+    # Contested (< 2 yards)
+    contested_targets = sum(is_contested),
+    contested_catches = sum(complete & is_contested, na.rm = TRUE),
+    contested_rate = ifelse(contested_targets > 0, 
+                            contested_catches / contested_targets * 100, 
+                            NA),
+    # Open (>= 2 yards)
+    open_targets = sum(!is_contested),
+    open_catches = sum(complete & !is_contested, na.rm = TRUE),
+    open_rate = ifelse(open_targets > 0,
+                       open_catches / open_targets * 100,
+                       NA),
+    .groups = "drop"
+  ) %>%
+  filter(contested_targets >= 10, open_targets >= 10)
+
+# Compute league-average contested rate
+league_avg_contested <- wr_by_coverage %>%
+  summarise(avg = mean(contested_rate, na.rm = TRUE)) %>%
+  pull(avg)
+
+# Add advantage metric
+wr_by_coverage <- wr_by_coverage %>%
+  mutate(
+    contested_advantage = contested_rate - league_avg_contested
+  )
+
+# ---------------------------------------------
+# Scatter Plot: Contested vs Open Catch Rates
+# ---------------------------------------------
+ggplot(wr_by_coverage,
+       aes(x = contested_rate, 
+           y = open_rate, 
+           size = total_targets)) +
+  
+  geom_point(alpha = 0.6, color = "steelblue") +
+  
+  # Label only high-target, high-performing WRs
+  geom_text(data = wr_by_coverage %>% 
+              filter(total_targets > 50 & contested_rate > 55),
+            aes(label = wr_name),
+            hjust = -0.1, vjust = 0, size = 3, show.legend = FALSE, check_overlap = T) +
+  
+  # 1:1 line (equal performance in contested vs open)
+  geom_abline(slope = 1, intercept = 0, 
+              linetype = "dashed", color = "red") +
+  
+  labs(
+    title = "WR Catch Rate: Contested vs Open Coverage",
+    subtitle = "Contested = <2 yds separation • Open = ≥2 yds separation",
+    x = "Contested Catch Rate (%)",
+    y = "Open Catch Rate (%)",
+    size = "Total Targets"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# ---------------------------------------------
+# VISUALIZATION 5: WRs who outperform in contested situations
+# Calculate differential: contested rate minus their own open rate
+# ---------------------------------------------
+wr_contested_diff <- wr_by_coverage %>%
+  mutate(
+    contested_vs_open_diff = contested_rate - open_rate
+  ) %>%
+  filter(!is.na(contested_vs_open_diff)) %>%
+  arrange(desc(contested_rate))
+
+ggplot(wr_contested_diff %>% head(20),
+       aes(x = reorder(wr_name, contested_rate),
+           y = contested_rate)) +
+  geom_col(aes(fill = contested_vs_open_diff > 0)) +
+  geom_text(aes(label = sprintf("%.0f%%", contested_rate)),
+            hjust = -0.2, size = 3) +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "darkgreen", "FALSE" = "orange"),
+                    labels = c("TRUE" = "Better contested", 
+                               "FALSE" = "Better open")) +
+  labs(title = "Top WRs by Contested Catch Rate",
+       subtitle = "Coverage within 2 yards (min 10 contested targets)",
+       x = "Player",
+       y = "Contested Catch Rate (%)",
+       fill = "Relative Strength") +
+  theme_minimal()
+```
+
+Here we display the final summary tables: completion by separation distance, contested catch ‘specialists,’ and how receivers. perform in tight coverage ve open coverage.
+
+```{r}
+completion_by_sep %>% head()
+
+contested_specialists %>% select(wr_name, contested_targets, contested_catches, contested_catch_rate, avg_separation) %>% head()
+
+wr_contested_diff %>% select(wr_name, contested_rate, open_rate, contested_vs_open_diff, total_targets) %>% arrange(desc(contested_vs_open_diff)) %>% head()
+```
+
+Synthesis
+
+Now that we have reaction and path quality data for both ball carriers, tacklers, receivers, and defensive backs, one overarching use of this data is that we can pit players against each other. For example, say Christian Gonzalez and Cee Dee Lamb go for a ball, the following code scales and scores their path efficiency to estimate who would ‘win’ the 1 vs. 1. The same can also be done for linebackers and ballcarriers meeting, using a similar scoring function. We would be able to simulate and predict a winner for if Bijan Robinson is running and Fred Warner is trying to tackle him.
+
+The df ‘Matchups’ contains every possible matchup, scored by the following from the wr_dist, db_dist, and wr_eff dataframes: wr_score = (-s_dist) + (2 * s_eff1) + (-s_ang) + (2 * s_eff2) and db_score = (2 * s_close) + (2 * s_close_p) so we take in closing quality, speed, and angle.
+
+We are then able to aggregate this into a function called ‘h2h’, comparing the scores and getting a hypothetical ‘winner’ for anybody that we’d like to see. See below.
+
+```{r}
+#matchups %>% head()
+```
+
+```{r}
+#h2h('CeeDee Lamb', 'Christian Gonzalez')
+```
+
+There are some limitations, for example:
+
+Limited sample size: The analysis is based on a single season of data, which may not capture year-to-year variability in player performance.
+
+Metric assumptions: Several metrics rely on simplified assumptions—such as limited information about throw type—that could introduce bias or reduce accuracy.
+
+Contextual gaps: (optional addition): Certain situational factors (e.g., play design, defensive scheme, or game context) are not fully captured in the dataset, which may affect how well the metrics reflect true player ability.
+
+Overall, we accomplished what we set out to do. We were able to use frame by frame data to effectively grade players reaction times based on orientation, speed, and acceleration to the ball. This works separately but similarily for DB and WR matchups meeting at the ball, or RB and Lb matchups meeting at the tackle point.
